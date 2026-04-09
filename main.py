@@ -36,6 +36,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+def home():
+    return {"message": "Jira AI Agent is running 🚀"}
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return None
+
 # Jira Configuration
 JIRA_DOMAIN = os.getenv("JIRA_DOMAIN")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
