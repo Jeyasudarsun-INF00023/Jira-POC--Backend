@@ -1,0 +1,14 @@
+[
+  {
+    "timestamp": "2026-04-09T17:29:15.357045",
+    "to": "jeyasudarsun@gmail.com",
+    "subject": "Action Required: Password Reset Request",
+    "body": "Hello, your internal application password reset link is: https://your-company.com/it-portal/reset"
+  },
+  {
+    "timestamp": "2026-04-09T17:30:38.104320",
+    "to": "jeyasudarsun@gmail.com",
+    "subject": "Action Required: Password Reset Request",
+    "body": "Hello, your internal application password reset link is: https://your-company.com/it-portal/reset"
+  }
+]

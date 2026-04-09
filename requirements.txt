@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+requests
+python-dotenv
+pydantic
+google-genai>=0.8.0
+sqlalchemy
+psycopg2-binary
