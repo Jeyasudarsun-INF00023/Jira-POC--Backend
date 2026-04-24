@@ -26,7 +26,8 @@ init_db()
 
 # AI Clients
 PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "KAN")
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai_api_key = os.getenv("OPENAI_API_KEY")
+openai_client = OpenAI(api_key=openai_api_key) if openai_api_key else None
 gemini_api_key = os.getenv("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
 app = FastAPI(title="Jira Incident Automation Agent")
@@ -156,6 +157,9 @@ def ai_agent_decision(summary, description, email, history_context="No previous 
     """
 
     try:
+        if not openai_client:
+            raise ValueError("OpenAI client not initialized. Check OPENAI_API_KEY environment variable.")
+            
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
