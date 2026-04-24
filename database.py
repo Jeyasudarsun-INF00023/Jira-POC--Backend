@@ -32,6 +32,15 @@ class IncidentDB(Base):
     type = Column(String)
     action = Column(Text)
     confidence = Column(String)
+    project = Column(String)
+    issuetype = Column(String)
+    assignee = Column(String)
+    duedate = Column(String)
+    labels = Column(Text)  # Store as comma-separated or JSON
+    team = Column(String)
+    start_date = Column(String)
+    reporter_id = Column(String)  # Jira Account ID for tagging
+    in_progress_at = Column(DateTime) # For 5-min auto-resolve tracking
     timestamp = Column(DateTime, default=datetime.utcnow)
 
 # Create tables

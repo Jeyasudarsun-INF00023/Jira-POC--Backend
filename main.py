@@ -1,18 +1,21 @@
 import os
 import json
 import requests
+from google import genai
+from openai import OpenAI
 import shutil
 from fastapi import FastAPI, Request, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
-from datetime import datetime
+import asyncio
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from google import genai
+from openai import OpenAI
 from sqlalchemy.orm import Session
 
 # Local Project Imports
-from jira_service import fetch_jira_issues, transform_issues
+from jira_service import fetch_jira_issues, transform_issues, transition_jira_issue, PROJECT_KEY
 from email_utils import send_email_via_n8n
 from database import init_db, SessionLocal, IncidentDB
 
@@ -21,12 +24,48 @@ load_dotenv()
 # Initialize Database on Startup
 init_db()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-GEMINI_FALLBACK_MODELS = [GEMINI_MODEL, "gemini-2.0-flash", "gemini-1.5-flash"]
-
-client = genai.Client(api_key=GEMINI_API_KEY)
+# AI Clients
+PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "KAN")
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+gemini_client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
 app = FastAPI(title="Jira Incident Automation Agent")
+
+# Auto-resolve background task
+async def auto_resolve_checker():
+    print("Background task: Auto-resolve checker started.")
+    while True:
+        await asyncio.sleep(60) # Check every minute
+        db = SessionLocal()
+        try:
+            five_mins_ago = datetime.utcnow() - timedelta(minutes=5)
+            # Find issues in progress for more than 5 mins
+            expired_issues = db.query(IncidentDB).filter(
+                IncidentDB.status == "In Progress",
+                IncidentDB.in_progress_at <= five_mins_ago
+            ).all()
+
+            if expired_issues:
+                print(f"Auto-resolve check: Found {len(expired_issues)} incidents ready for resolution.")
+            
+            for issue in expired_issues:
+                print(f"Auto-resolving {issue.key} after 5 mins...")
+                success, msg = transition_jira_issue(issue.key, "Resolved")
+                if success:
+                    issue.status = "Resolved"
+                    issue.action = "Auto-resolved after 5 minutes"
+                    db.commit()
+                    update_jira_ticket(issue.key, "AI Agent: Incident automatically resolved after 5 minutes of inactivity.")
+                else:
+                    print(f"Failed to auto-resolve {issue.key}: {msg}")
+        except Exception as e:
+            print(f"Auto-resolve error: {e}")
+        finally:
+            db.close()
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(auto_resolve_checker())
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,7 +77,8 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {"message": "Jira AI Agent is running 🚀"}
+    print("Home endpoint hit")
+    return {"message": "Jira AI Agent is running"}
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
@@ -66,60 +106,100 @@ class JiraWebhook(BaseModel):
 # Step 2: Agent Service (Core Engine)
 # ---------------------------------------------------------
 
-def detect_intent(summary: str, description: str):
+def ai_agent_decision(summary, description, email, history_context="No previous history"):
     prompt = f"""
-    Classify the IT incident into one of these intents: RESET_PASSWORD, SERVICE_DOWN, PERFORMANCE_ISSUE, DISK_FULL, or UNKNOWN.
+    You are an enterprise IT incident automation agent.
+
+    Your job:
+    - Understand the issue
+    - Identify intent
+    - Identify application/system
+    - Decide best action
+    - Generate user-ready response
+
+    Allowed actions:
+    - send_email
+    - resolve_ticket
+    - escalate
+
+    Rules:
+    - Be precise and professional.
+    - Prefer self-service solutions with clear, numbered steps.
+    - Use real links:
+        * Google Account: https://accounts.google.com/signin/recovery
+        * Office 365: https://passwordreset.microsoftonline.com
+        * Software: Provide direct official download links (e.g., VS Code, Chrome, etc. if known)
+    - Specific Guidance:
+        * For "WiFi/Network" issues, provide steps like checking the SSID, toggling WiFi, and forgetting the network.
+        * For "Performance/Slow Internet", suggest clearing browser cache, checking background apps, or running a speed test.
+        * For "Software Requests", identify the software and provide its official download URL.
+    - Avoid generic answers; be helpful.
+
+    Return ONLY JSON:
+
+    {{
+      "intent": "...",
+      "application": "...",
+      "action_type": "send_email | resolve_ticket | escalate",
+      "email_subject": "...",
+      "email_body": "...",
+      "confidence": "high | medium | low"
+    }}
+
+    History (Previous Tickets):
+    {history_context}
+
+    Incident:
     Summary: {summary}
     Description: {description}
-    Return JSON ONLY:
-    {{
-      "intent": "RESET_PASSWORD | SERVICE_DOWN | PERFORMANCE_ISSUE | DISK_FULL | UNKNOWN",
-      "application": "...",
-      "confidence": "high | medium | low",
-      "missing_info": "..."
-    }}
+    User Email: {email}
     """
-    if not GEMINI_API_KEY: return {"intent": "UNKNOWN", "application": "unknown", "confidence": "low"}
 
-    for model_name in GEMINI_FALLBACK_MODELS:
-        try:
-            response = client.models.generate_content(model=model_name, contents=prompt)
-            text = (response.text or "").strip()
-            start_idx = text.find('{')
-            end_idx = text.rfind('}') + 1
-            if start_idx == -1: continue
-            return json.loads(text[start_idx:end_idx])
-        except: continue
-    return {"intent": "UNKNOWN", "application": "unknown", "confidence": "low"}
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2
+        )
 
-def handle_ai_action(intent_data: dict, email: str, issue_key: str):
-    intent = intent_data.get("intent")
-    app_name = intent_data.get("application", "unknown").lower()
-    summary_lower = intent_data.get("summary", "").lower()
-    
-    if app_name == "unknown":
-        if "office 365" in summary_lower: app_name = "Office 365"
-        elif "google" in summary_lower: app_name = "Google"
+        content = response.choices[0].message.content.strip()
 
-    if intent == "RESET_PASSWORD":
-        reset_link = "https://your-company.com/reset"
-        if "office 365" in app_name.lower(): reset_link = "https://passwordreset.microsoftonline.com"
-        elif "google" in app_name.lower(): reset_link = "https://accounts.google.com/signin/recovery"
-        
-        subject = f"Action Required: {app_name} Password Reset"
-        body = f"Hello, we detected a password reset request for {app_name.upper()}.\n\nLink: {reset_link}"
-        send_email_via_n8n(email, subject, body, issue_key)
-        return f"SENT: {app_name} recovery link sent to {email}"
-            
-    elif intent == "DISK_FULL": return "Automation: Clearing temp files."
-    elif intent == "SERVICE_DOWN": return "Automation: Restarting service."
-    return "I need more details to automate a fix."
+        # Extract JSON safely
+        start = content.find("{")
+        end = content.rfind("}") + 1
+        if start == -1: raise ValueError("No JSON found in response")
+
+        return json.loads(content[start:end])
+
+    except Exception as e:
+        print("AI Error:", e)
+        return {
+            "intent": "UNKNOWN",
+            "application": "unknown",
+            "action_type": "escalate",
+            "email_subject": "AI Error",
+            "email_body": f"Agent failed: {str(e)}",
+            "confidence": "low"
+        }
+
+def validate_action(ai_decision):
+    # Example safety check: Avoid destructive actions suggested in email
+    body = ai_decision.get("email_body", "").lower()
+    unsafe_keywords = ["delete all", "format drive", "uninstall everything"]
+    for word in unsafe_keywords:
+        if word in body:
+            return False
+    return True
+
 
 @app.get("/incidents")
 async def get_incidents(db: Session = Depends(get_db)):
+    print("[GET /incidents] Request received")
     try:
+        print(f"Fetching from Jira (Project: {PROJECT_KEY})...")
         raw_data = fetch_jira_issues()
         real_issues = transform_issues(raw_data)
+        print(f"Found {len(real_issues)} issues in Jira")
         
         db_issues = db.query(IncidentDB).all()
         db_map = {i.key: i for i in db_issues}
@@ -135,19 +215,28 @@ async def get_incidents(db: Session = Depends(get_db)):
                 })
         
         # Include simulated or Jira-deleted ones if they are in DB
-        simulated = [
-            {
-                "key": i.key, "summary": i.summary, "reporter_email": i.reporter_email,
-                "priority": i.priority, "status": i.status, "type": i.type,
-                "action": i.action, "confidence": i.confidence, "timestamp": i.timestamp.isoformat()
-            } 
-            for i in db_issues if not any(r["key"] == i.key for r in real_issues)
-        ]
+        simulated = []
+        for i in db_issues:
+            if not any(r["key"] == i.key for r in real_issues):
+                try:
+                    ts = i.timestamp.isoformat() if i.timestamp else ""
+                except:
+                    ts = ""
+                simulated.append({
+                    "key": i.key, "summary": i.summary, "reporter_email": i.reporter_email,
+                    "priority": i.priority, "status": i.status, "type": i.type,
+                    "action": i.action, "confidence": i.confidence, "timestamp": ts,
+                    "project": i.project, "issuetype": i.issuetype, "assignee": i.assignee,
+                    "duedate": i.duedate, "labels": i.labels, "team": i.team, "start_date": i.start_date
+                })
         
         combined = real_issues + simulated
-        return {"incidents": sorted(combined, key=lambda x: x.get("timestamp", ""), reverse=True)}
+        # Filter out any issues that might have broken timestamps for sorting
+        sorted_incidents = sorted(combined, key=lambda x: str(x.get("timestamp", "")), reverse=True)
+        print(f"Returning {len(sorted_incidents)} incidents ({len(real_issues)} from Jira, {len(simulated)} from DB)")
+        return {"incidents": sorted_incidents, "jira_error": False}
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"get_incidents error: {e}")
         return {"incidents": [], "jira_error": True}
 
 @app.post("/analyze-fix/{issue_key}")
@@ -160,8 +249,17 @@ async def analyze_and_fix(issue_key: str, background_tasks: BackgroundTasks, db:
         if not j_incident: return {"status": "error", "message": "Not found"}
         
         incident = IncidentDB(
-            key=j_incident["key"], summary=j_incident["summary"], 
-            reporter_email=j_incident["reporter_email"], priority=j_incident["priority"],
+            key=j_incident["key"], 
+            summary=j_incident["summary"], 
+            description=j_incident.get("description", ""),
+            reporter_email=j_incident["reporter_email"], 
+            priority=j_incident["priority"],
+            project=j_incident.get("project"), 
+            issuetype=j_incident.get("issuetype"),
+            assignee=j_incident.get("assignee"),
+            duedate=j_incident.get("duedate"),
+            labels=j_incident.get("labels"),
+            team=j_incident.get("team"),
             status="Processing"
         )
         db.add(incident)
@@ -181,19 +279,49 @@ async def escalate_manual(issue_key: str, db: Session = Depends(get_db)):
     update_jira_ticket(issue_key, "Manually escalated.")
     return {"status": "escalated", "issue_key": issue_key}
 
+@app.post("/resolve/{issue_key}")
+async def resolve_manual(issue_key: str, db: Session = Depends(get_db)):
+    success, message = transition_jira_issue(issue_key, "Resolved")
+    if success:
+        update_incident_state_db(db, issue_key, status="Resolved", action="Manually Resolved")
+        update_jira_ticket(issue_key, "AI Agent: Incident resolved by manual confirmation.", status="Resolved")
+        return {"status": "resolved", "issue_key": issue_key}
+    else:
+        return {"status": "error", "message": message}
+
 @app.post("/webhook")
-async def handle_jira_webhook(payload: JiraWebhook, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    issue = payload.issue
-    fields = issue.get("fields", {})
+async def handle_jira_webhook(payload: dict, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    print("[POST /webhook] DATA RECEIVED:")
+    try:
+        print(json.dumps(payload, indent=2)[:1000])
+    except:
+        print("Could not print full payload due to encoding")
+    issue = payload.get("issue", {})
+    issue_key = issue.get("key")
+    if not issue_key:
+        print("Webhook received but no issue key found in payload.")
+        return {"status": "ignored"}
+    
+    print(f"Processing Webhook for Issue: {issue_key}")
 
     existing = db.query(IncidentDB).filter(IncidentDB.key == issue.get("key")).first()
     if not existing:
+        # Use transform_issues logic for consistency
+        transformed = transform_issues({"issues": [issue]})[0]
         new_inc = IncidentDB(
-            key=issue.get("key"),
-            summary=fields.get("summary", "No Summary"),
-            description=fields.get("description", ""),
-            priority=fields.get("priority", {}).get("name", "Medium") if fields.get("priority") else "Medium",
-            reporter_email=fields.get("reporter", {}).get("emailAddress") or fields.get("reporter", {}).get("displayName", "unknown"),
+            key=transformed["key"],
+            summary=transformed["summary"],
+            description=transformed["description"],
+            priority=transformed["priority"],
+            reporter_email=transformed["reporter_email"],
+            project=transformed["project"],
+            issuetype=transformed["issuetype"],
+            assignee=transformed["assignee"],
+            duedate=transformed["duedate"],
+            labels=transformed["labels"],
+            team=transformed["team"],
+            start_date=transformed["start_date"],
+            reporter_id=transformed.get("reporter_id"),
             status="Processing",
             timestamp=datetime.now()
         )
@@ -202,7 +330,8 @@ async def handle_jira_webhook(payload: JiraWebhook, background_tasks: Background
         existing.status = "Processing"
     
     db.commit()
-    background_tasks.add_task(process_incident, issue.get("key"))
+    print(f"Issue {issue_key} saved/updated in DB. Starting background process...")
+    background_tasks.add_task(process_incident, issue_key)
     return {"status": "accepted"}
 
 @app.delete("/incidents/{issue_key}")
@@ -223,62 +352,133 @@ def update_incident_state_db(db: Session, key: str, **kwargs):
 async def process_incident(issue_key: str):
     db = SessionLocal()
     incident = db.query(IncidentDB).filter(IncidentDB.key == issue_key).first()
-    if not incident: return
+
+    if not incident:
+        print(f"Incident {issue_key} not found")
+        return
+
+    print(f"Processing {issue_key}")
 
     try:
-        update_incident_state_db(db, issue_key, status="Detecting Intent")
-        intent_data = detect_intent(incident.summary, incident.description or "")
-        
-        intent = intent_data.get("intent", "UNKNOWN")
-        confidence = intent_data.get("confidence", "low")
-        
-        if confidence == "low" or intent == "UNKNOWN":
-            fallback = classify_incident_text(incident.summary, incident.description or "")
-            if fallback != "UNKNOWN":
-                intent, confidence = fallback, "medium (fallback)"
-            else:
-                update_incident_state_db(db, issue_key, status="Awaiting Info", action="Asked for Details")
-                update_jira_ticket(issue_key, "AI Agent: Need more details.")
-                return
+        # Move to In Progress
+        transition_jira_issue(issue_key, "In Progress")
+        update_incident_state_db(db, issue_key, status="In Progress", in_progress_at=datetime.utcnow())
 
-        update_incident_state_db(db, issue_key, type=intent, confidence=confidence, status="Deciding Action")
-        intent_data["summary"] = incident.summary
-        action_response = handle_ai_action(intent_data, incident.reporter_email or "unknown", issue_key)
-        update_incident_state_db(db, issue_key, action=action_response)
+        #  CONTEXT AWARENESS (Memory)
+        previous_tickets = db.query(IncidentDB).filter(
+            IncidentDB.reporter_email == incident.reporter_email,
+            IncidentDB.key != issue_key
+        ).order_by(IncidentDB.timestamp.desc()).limit(3).all()
         
-        if intent == "RESET_PASSWORD":
-            update_incident_state_db(db, issue_key, status="Resolved")
-            update_jira_ticket(issue_key, f"AI Agent: {action_response}", status="Resolved")
+        history_text = "\n".join([f"- {t.key}: {t.summary} ({t.status})" for t in previous_tickets]) if previous_tickets else "No previous history"
+
+        #  AI DECISION
+        ai_result = ai_agent_decision(
+            incident.summary,
+            incident.description or "",
+            incident.reporter_email or "unknown",
+            history_context=history_text
+        )
+
+        print("AI Decision:", ai_result)
+
+        confidence = ai_result.get("confidence", "low")
+
+        #  SAFETY & CONFIDENCE CHECK
+        if confidence == "low":
+            update_incident_state_db(db, issue_key, status="Escalated", action="AI not confident")
+            update_jira_ticket(issue_key, "AI Agent: Could not confidently resolve. Escalated to human IT support.")
+            return
+
+        if not validate_action(ai_result):
+            update_incident_state_db(db, issue_key, status="Escalated", action="Safety validation failed")
+            update_jira_ticket(issue_key, "AI Agent: Safety check failed. Escalating.")
+            return
+
+        action = ai_result.get("action_type")
+        print(f"AI Result Action: {action}")
+
+        #  EXECUTION LAYER
+        if action == "send_email":
+            email = incident.reporter_email
+            print(f"Attempting to send email to: {email}")
+            if not email or "@" not in email:
+                email = os.getenv("JIRA_EMAIL")
+                print(f"Using fallback email: {email}")
+
+            print(f"Triggering n8n for {issue_key} (Email: {email}, Subject: {ai_result.get('email_subject')})")
+            success = send_email_via_n8n(
+                email,
+                ai_result.get("email_subject", "IT Support Update"),
+                ai_result.get("email_body", ""),
+                issue_key
+            )
+            if success:
+                msg = "Email sent via AI"
+                update_incident_state_db(db, issue_key, status="In Progress", action=msg)
+                # Enhanced Comment with Mention
+                tag_comment = "Mail received for you to follow those steps and clear your incident."
+                update_jira_ticket(issue_key, tag_comment, mention_id=incident.reporter_id)
+            else:
+                update_incident_state_db(db, issue_key, status="Failed", action="Email failed")
+
+        elif action == "resolve_ticket":
+            success, msg = transition_jira_issue(issue_key, "Resolved")
+            status = "Resolved" if success else "Failed"
+            action_msg = msg
+
         else:
-            # Simple execution mock
-            update_incident_state_db(db, issue_key, status="Executing")
-            update_incident_state_db(db, issue_key, status="Resolved")
-            update_jira_ticket(issue_key, f"AI Agent: Automation executed for {intent}.", status="Resolved")
-            
+            status = "Escalated"
+            action_msg = "Escalated by AI"
+
+        # Final DB Update for non-email actions
+        if action != "send_email":
+            update_incident_state_db(
+                db,
+                issue_key,
+                status=status,
+                type=ai_result.get("intent"),
+                action=action_msg,
+                confidence=confidence
+            )
+
+            #  Add Jira Comment for non-email actions
+            update_jira_ticket(
+                issue_key,
+                f"AI Agent:\nIntent: {ai_result.get('intent')}\nAction: {action_msg}\nConfidence: {confidence}"
+            )
+
     except Exception as e:
-        print(f"Error: {e}")
-        update_incident_state_db(db, issue_key, status=f"Error: {e}")
+        print("Error:", e)
+        update_incident_state_db(db, issue_key, status="Error")
+
     finally:
         db.close()
 
-def classify_incident_text(summary: str, description: str) -> str:
-    text = (summary + " " + description).lower()
-    if "password" in text or "reset" in text: return "RESET_PASSWORD"
-    if "down" in text or "offline" in text: return "SERVICE_DOWN"
-    if "disk" in text or "storage" in text: return "DISK_FULL"
-    return "UNKNOWN"
-
-def update_jira_ticket(issue_key: str, comment: str, status: str = None):
+def update_jira_ticket(issue_key: str, comment: str, mention_id: str = None):
     url = f"https://{JIRA_DOMAIN}/rest/api/3/issue/{issue_key}/comment"
+    
+    content = []
+    if mention_id:
+        content.append({
+            "type": "mention",
+            "attrs": {"id": mention_id, "text": "@user"}
+        })
+        content.append({"type": "text", "text": " "})
+    
+    content.append({"type": "text", "text": comment})
+
     payload = {
         "body": {
-            "type": "doc", "version": 1,
-            "content": [{"type": "paragraph", "content": [{"text": comment, "type": "text"}]}]
+            "type": "doc",
+            "version": 1,
+            "content": [{"type": "paragraph", "content": content}]
         }
     }
     try:
         requests.post(url, json=payload, auth=JIRA_AUTH, headers={"Content-Type": "application/json"})
-    except: pass
+    except Exception as e:
+        print(f"Jira comment error: {e}")
 
 if __name__ == "__main__":
     import uvicorn
